@@ -1,23 +1,28 @@
-from typing import Optional
+from __future__ import annotations
 
-import json
 import os
 import shutil
 import time
+from typing import List, Optional
+
+try:
+    from defusedxml.ElementTree import parse as ET_parse
+except ImportError:
+    from xml.etree.ElementTree import parse as ET_parse
 
 import eecs598
 import matplotlib.pyplot as plt
 import torch
 from PIL import Image
 from torch import optim
-from torchvision import transforms
+from torchvision import datasets, transforms
 
 
 def hello_helper():
     print("Hello from a4_helper.py!")
 
 
-class VOC2007DetectionTiny(torch.utils.data.Dataset):
+class VOC2007DetectionTiny(datasets.VOCDetection):
     """
     A tiny version of PASCAL VOC 2007 Detection dataset that includes images and
     annotations with small images and no difficult boxes.
@@ -37,12 +42,11 @@ class VOC2007DetectionTiny(torch.utils.data.Dataset):
                 will be resized to this size, followed by a center crop. For
                 val, center crop will not be taken to capture all detections.
         """
-        super().__init__()
+        super().__init__(
+            dataset_dir, year="2007", image_set=split, download=download
+        )
+        self.split = split
         self.image_size = image_size
-
-        # Attempt to download the dataset from Justin's server:
-        if download:
-            self._attempt_download(dataset_dir)
 
         # fmt: off
         voc_classes = [
@@ -61,11 +65,32 @@ class VOC2007DetectionTiny(torch.utils.data.Dataset):
             _idx: _class for _idx, _class in enumerate(voc_classes)
         }
 
-        # Load instances from JSON file:
-        self.instances = json.load(
-            open(os.path.join(dataset_dir, f"voc07_{split}.json"))
-        )
-        self.dataset_dir = dataset_dir
+        # Super class creates a list of image paths (JPG) and annotation paths
+        # (XML) to read from everytime `__getitem__` is called. Here we parse
+        # all annotation XMLs and only keep those which have at least one object
+        # class in our required subset.
+        filtered_instances = []
+
+        for image_path, target_xml in zip(self.images, self.targets):
+
+            target = self.parse_voc_xml(ET_parse(target_xml).getroot())
+            # Only keep this sample if at least one instance belongs to subset.
+            # NOTE: Ignore objects that are annotated as "difficult". These
+            # are marked such because they are challenging to detect without
+            # surrounding context, and VOC evaluation leaves them out. Hence
+            # we discard them both during training and validation.
+            _ann = [
+                inst
+                for inst in target["annotation"]["object"]
+                if inst["name"] in voc_classes and inst["difficult"] == "0"
+            ]
+            if len(_ann) > 0:
+                filtered_instances.append((image_path, _ann))
+
+        self.instances = filtered_instances
+
+        # Delete stuff from super class, we only use `self.instances`
+        del self.images, self.targets
 
         # Define a transformation function for image: Resize the shorter image
         # edge then take a center crop (optional) and normalize.
@@ -77,39 +102,10 @@ class VOC2007DetectionTiny(torch.utils.data.Dataset):
                 mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
             ),
         ]
+        # if split == "train":
+        #     _transforms.insert(1, transforms.CenterCrop(image_size))
+
         self.image_transform = transforms.Compose(_transforms)
-
-    @staticmethod
-    def _attempt_download(dataset_dir: str):
-        """
-        Try to download VOC dataset and save it to `dataset_dir`.
-        """
-        import wget
-
-        os.makedirs(dataset_dir, exist_ok=True)
-        # fmt: off
-        wget.download(
-            "https://web.eecs.umich.edu/~justincj/data/VOCtrainval_06-Nov-2007.tar",
-            out=dataset_dir,
-        )
-        wget.download(
-            "https://web.eecs.umich.edu/~justincj/data/voc07_train.json",
-            out=dataset_dir,
-        )
-        wget.download(
-            "https://web.eecs.umich.edu/~justincj/data/voc07_val.json",
-            out=dataset_dir,
-        )
-        # fmt: on
-
-        # Extract TAR file:
-        import tarfile
-
-        voc_tar = tarfile.open(
-            os.path.join(dataset_dir, "VOCtrainval_06-Nov-2007.tar")
-        )
-        voc_tar.extractall(dataset_dir)
-        voc_tar.close()
 
     def __len__(self):
         return len(self.instances)
@@ -117,13 +113,21 @@ class VOC2007DetectionTiny(torch.utils.data.Dataset):
     def __getitem__(self, index: int):
         # PIL image and dictionary of annotations.
         image_path, ann = self.instances[index]
-        # TODO: Remove this after the JSON files are fixed on Justin's server:
-        image_path = image_path.replace("./here/", "")
-        image_path = os.path.join(self.dataset_dir, image_path)
         image = Image.open(image_path).convert("RGB")
 
         # Collect a list of GT boxes: (N, 4), and GT classes: (N, )
-        gt_boxes = torch.tensor([inst["xyxy"] for inst in ann])
+        gt_boxes = [
+            torch.Tensor(
+                [
+                    float(inst["bndbox"]["xmin"]),
+                    float(inst["bndbox"]["ymin"]),
+                    float(inst["bndbox"]["xmax"]),
+                    float(inst["bndbox"]["ymax"]),
+                ]
+            )
+            for inst in ann
+        ]
+        gt_boxes = torch.stack(gt_boxes)  # (N, 4)
         gt_classes = torch.Tensor([self.class_to_idx[inst["name"]] for inst in ann])
         gt_classes = gt_classes.unsqueeze(1)  # (N, 1)
 
@@ -254,7 +258,7 @@ def train_detector(
 
     # Plot training loss.
     plt.title("Training loss history")
-    plt.xlabel(f"Iteration (x {log_period})")
+    plt.xlabel("Iteration")
     plt.ylabel("Loss")
     plt.plot(loss_history)
     plt.show()
@@ -264,11 +268,11 @@ def inference_with_detector(
     detector,
     test_loader,
     idx_to_class,
-    score_thresh: float,
-    nms_thresh: float,
-    output_dir: Optional[str] = None,
-    dtype: torch.dtype = torch.float32,
-    device:str = "cpu",
+    score_thresh: float | None = None,
+    nms_thresh: float | None = None,
+    output_dir: str | None = None,
+    dtype=torch.float32,
+    device="cpu",
 ):
 
     # ship model to GPU
@@ -359,3 +363,8 @@ def inference_with_detector(
 
     end_t = time.time()
     print(f"Total inference time: {end_t-start_t:.1f}s")
+
+
+if __name__ == "__main__":
+    dset = VOC2007DetectionTiny("./EECS-498/A4")
+    dset[0]
